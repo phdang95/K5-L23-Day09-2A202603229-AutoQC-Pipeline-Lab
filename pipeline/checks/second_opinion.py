@@ -39,6 +39,89 @@ from ..common import WARN, Issue, iou_xywh, parse_yolo_line  # noqa: F401
 from ..model_cache import get_preds  # noqa: F401
 
 
+def _read_valid_labels(ds, stem: str) -> list[tuple[int, int, tuple[float, float, float, float]]] | None:
+    """Đọc nhãn hợp lệ kèm số dòng gốc (từ 1); trả None nếu không có file nhãn."""
+    lines = ds.read_label_lines(stem)
+    if lines is None:
+        return None
+    n_classes = len(ds.classes)
+    valid = []
+    for line_no, raw in lines:
+        try:
+            cls_id, cx, cy, w, h = parse_yolo_line(raw)
+        except ValueError:
+            continue
+        if 0 <= cls_id < n_classes and w > 0 and h > 0:
+            valid.append((line_no, cls_id, (cx, cy, w, h)))
+    return valid
+
+
 def run(ds, cfg, preds=None):
-    # TODO
-    raise NotImplementedError("check second_opinion chưa làm")
+    """So nhãn với dự đoán model lớn hơn để cảnh báo thiếu/nhầm lớp/box lỏng/dư."""
+    if preds is None:
+        preds = get_preds(ds, cfg, "checker")
+
+    so_cfg = cfg["second_opinion"]
+    conf_thr = so_cfg["conf"]
+    min_area_px = so_cfg["min_area_px"]
+    fp_conf = so_cfg["fp_conf"]
+    iou_missing = so_cfg["iou_missing"]
+    iou_match = so_cfg["iou_match"]
+    iou_loose = so_cfg["iou_loose"]
+
+    issues = []
+    for img_path in ds.image_files():
+        stem = img_path.stem
+        if stem not in preds:
+            continue
+        labels = _read_valid_labels(ds, stem)
+        if labels is None:
+            continue
+        img_size = ds.image_size(stem)
+        if img_size is None:
+            continue
+        img_w, img_h = img_size
+        raw_preds = preds[stem]
+
+        # Pha A: kiểm từng dự đoán đạt ngưỡng conf và min_area_px
+        for p in raw_preds:
+            p_cls, p_conf, pcx, pcy, pw, ph = p
+            area_px = (pw * img_w) * (ph * img_h)
+            if p_conf < conf_thr or area_px < min_area_px:
+                continue
+            p_box = (pcx, pcy, pw, ph)
+            cands = []
+            for _, l_cls, l_box in labels:
+                iou = iou_xywh(p_box, l_box)
+                if iou >= iou_missing:
+                    cands.append((l_cls, iou))
+
+            if not cands:
+                issues.append(
+                    Issue("second_opinion", WARN, "POSSIBLE_MISSING", stem, f"model thấy lớp {p_cls} (conf={p_conf:.2f}) nhưng thiếu nhãn", extra={"conf": p_conf})
+                )
+                continue
+
+            same_ious = [iou for l_cls, iou in cands if l_cls == p_cls]
+            if same_ious:
+                best_same = max(same_ious)
+                if best_same < iou_loose:
+                    issues.append(
+                        Issue("second_opinion", WARN, "POSSIBLE_LOOSE_BOX", stem, f"box lớp {p_cls} lỏng (IoU={best_same:.2f})", extra={"conf": p_conf, "iou": best_same})
+                    )
+            else:
+                best_diff = max(iou for _, iou in cands)
+                if best_diff >= iou_match:
+                    issues.append(
+                        Issue("second_opinion", WARN, "POSSIBLE_WRONG_CLASS", stem, f"nghi nhầm lớp thành {p_cls} (IoU={best_diff:.2f})", extra={"conf": p_conf, "iou": best_diff})
+                    )
+
+        # Pha B: kiểm nhãn thừa (dùng fp_conf, KHÔNG lọc min_area_px)
+        fp_preds = [(p[2], p[3], p[4], p[5]) for p in raw_preds if p[1] >= fp_conf]
+        for line_no, l_cls, l_box in labels:
+            if not any(iou_xywh(l_box, p_box) >= iou_missing for p_box in fp_preds):
+                issues.append(
+                    Issue("second_opinion", WARN, "POSSIBLE_FALSE_POS", stem, f"nhãn lớp {l_cls} không khớp dự đoán nào", line=line_no)
+                )
+
+    return issues
