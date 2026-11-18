@@ -63,31 +63,31 @@ Cấu hình: `yolo26n`, `20` epochs, `2` seeds (`0`, `1`) trên Google Colab T4 
 **(a) Quyết định cuối:** Hiện giữ trạng thái **HOLD** (`38/202 = 18.81% >= 10%`), xuất bản nháp `clean_v1/` để thử nghiệm train. Để đạt **Release**, cần tăng ngân sách duyệt thêm ít nhất **18–20 ảnh** (từ 80 lên ~100 ảnh) để kéo số ảnh còn cảnh báo chưa duyệt xuống dưới `20/202` (`< 10%`).
 
 **(b0) Tìm hiểu kiến trúc & 4 module (CP2):**
-- **Prompt →** Yêu cầu phân tích kiến trúc pipeline AutoQC, vị trí, chức năng, vào/ra và bẫy của 4 module (`label_format.py`, `gate.py`, `autofix.py`, `second_opinion.py`).
-- **AI trả gì →** Sơ đồ luồng `intake -> QC (3 vòng) -> autofix -> human review -> gate -> export` và bảng đặc tả vào/ra từng module.
+- **Prompt →** Phân tích kiến trúc pipeline AutoQC và xác định rõ vị trí, chức năng, đầu vào, đầu ra, cùng các ca bẫy của 4 module (`label_format.py`, `gate.py`, `autofix.py`, `second_opinion.py`) trước khi cài đặt TDD.
+- **AI trả gì →** Sơ đồ luồng `intake -> QC (3 vòng) -> autofix -> human review -> gate -> export` và bản đồ vào/ra: `label_format.py` + `second_opinion.py` (chạy trong QC 3 vòng: nhận `ds` + `cfg` $\to$ trả `list[Issue]`); `autofix.py` (giữa QC v1 và v2: nhận `ds` + `ERROR` $\to$ sửa `ds`, trả `list[dict]` ghi `03_fixes.csv`); `gate.py` (sau QC v3: nhận `issues3` + `stems` + `reviewed` $\to$ trả `verdict` `Rework`/`Hold`/`Release` & exit code `20`/`10`/`0`).
 - **Tôi kiểm bằng cách nào →** Đối chiếu trực tiếp với `docs/PIPELINE.md`, `pipeline/run.py`, và docstring của 4 file stub.
-- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Ban đầu AI tóm tắt chung; tôi yêu cầu chỉ rõ vị trí gọi hàm trong `run.py` và danh sách bẫy từng module trước khi code.
+- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Ban đầu AI tóm tắt chung; tôi yêu cầu chỉ rõ vị trí gọi hàm trong `run.py` và danh sách ca bẫy từng module trước khi bắt tay vào code.
 
 **(b1) `label_format.py`:**
-- **Prompt →** Viết `pipeline/checks/label_format.py` nhận `ds`, `cfg`; kiểm tra từng dòng YOLO, trả `list[Issue]` đủ 7 mã (`BAD_FORMAT`, `BAD_CLASS_ID`, `BOX_ZERO`, `BOX_OUT_OF_IMAGE` kèm `extra={"overflow": ...}`, `DUP_BOX`, `BOX_TINY`, `BOX_HUGE`), giữ số dòng gốc khi có dòng trắng, đọc ngưỡng từ `cfg["label_format"]`.
-- **AI trả gì →** Hàm `run(ds, cfg)` dùng `ds.read_label_lines(stem)`, `parse_yolo_line`, `iou_xywh`, `ds.image_size(stem)` và kiểm tra đủ 7 mã.
-- **Tôi kiểm bằng cách nào →** Đọc từng dòng (không xóa/ghi file, không `except: pass`, không hardcode ngưỡng) và chạy `python -m pytest tests/test_label_format.py -q` (`14 passed`).
-- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Lần đầu cài môi trường trên Python 3.15.2, `pip install -r requirements.txt` lỗi build wheel `pyyaml` nên phải cài thẳng `pip install imagehash`; trong code yêu cầu kiểm tra `img_size is not None` trước khi tính `BOX_TINY` để không crash với nhãn mồ côi.
+- **Prompt →** Viết `pipeline/checks/label_format.py` nhận `ds` (từ `work/run/ds/`, không sửa dữ liệu gốc) và `cfg`; đọc từng dòng YOLO (`id cx cy w h`), trả `list[Issue]` phân biệt đủ 7 mã (`BAD_FORMAT`, `BAD_CLASS_ID`, `BOX_ZERO`, `BOX_OUT_OF_IMAGE` kèm `extra={"overflow": ...}`, `DUP_BOX`, `BOX_TINY`, `BOX_HUGE`), giữ nguyên số dòng khi có dòng trống, đọc mọi ngưỡng từ `cfg["label_format"]`.
+- **AI trả gì →** Hàm `run(ds, cfg)` dùng `ds.read_label_lines(stem)` giữ số dòng gốc, `parse_yolo_line`, `iou_xywh`, `ds.image_size(stem)` và xử lý đủ 7 mã lỗi/cảnh báo.
+- **Tôi kiểm bằng cách nào →** Đọc từng dòng (không xóa/ghi file, không `except: pass`, không hardcode ngưỡng, có kiểm tra `img_size is not None`) và chạy `python -m pytest tests/test_label_format.py -q` đạt `14 passed`.
+- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Khi cài môi trường trên Python 3.15.2, `pip install -r requirements.txt` lỗi build wheel `pyyaml` (thiếu MSVC Build Tools) nên phải cài trực tiếp `pip install imagehash`; trong code yêu cầu kiểm tra kỹ `img_size is not None` trước khi tính `BOX_TINY` để không crash với file nhãn không có ảnh.
 
 **(b2) `gate.py`:**
-- **Prompt →** Viết `pipeline/steps/gate.py` hàm `decide(issues, image_stems, cfg, reviewed=frozenset())` trả `dict` (`decision`, `n_errors`, `n_warn_images`, `n_images`, `warn_ratio`, `reasons`), `ERROR` không bị `reviewed` bỏ qua, tránh chia cho `0`.
-- **AI trả gì →** Hàm `decide` đếm `n_errors` toàn bộ `ERROR`, dùng `set` đếm ảnh `WARN` duy nhất trong `image_stems` và ngoài `reviewed`, xét ngưỡng `>= cfg["gate"]["warn_ratio_hold"]`.
-- **Tôi kiểm bằng cách nào →** Kiểm tra không hardcode `0.10`, chạy `python -m pytest tests/test_gate.py -q` (`10 passed`) và chạy `pipeline.run --budget 0` ra `Rework` (exit `20`).
-- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Yêu cầu làm rõ việc lọc bỏ issue cấp dataset (`"<dataset>"`, `"data.yaml"`) và ảnh đã xóa khỏi `image_stems` để không làm sai mẫu số/tử số.
+- **Prompt →** Viết `pipeline/steps/gate.py` hàm `decide(issues, image_stems, cfg, reviewed=frozenset())` trả `dict` (`decision`, `n_errors`, `n_warn_images`, `n_images`, `warn_ratio`, `reasons`), đếm `ERROR` không loại theo `reviewed`, đếm ảnh `WARN` duy nhất nằm trong `image_stems` và ngoài `reviewed`, tránh chia cho `0`, so `>= cfg["gate"]["warn_ratio_hold"]`.
+- **AI trả gì →** Hàm `decide` đếm `n_errors` toàn bộ `ERROR`, dùng set comprehension lấy `warn_images` duy nhất, làm tròn `warn_ratio` 4 chữ số, kèm `reasons` tiếng Việt có số liệu.
+- **Tôi kiểm bằng cách nào →** Kiểm tra không hardcode ngưỡng `0.10`, không bỏ qua `ERROR` đã duyệt; chạy `python -m pytest tests/test_gate.py -q` đạt `10 passed` và chạy `pipeline.run --budget 0` ra `Rework` (exit `20`).
+- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Yêu cầu làm rõ xử lý biên `n_images == 0` trả `warn_ratio = 0.0`, lọc bỏ issue cấp dataset (`"<dataset>"`, `"data.yaml"`) và ảnh đã xóa khỏi `image_stems` để không làm sai tử/mẫu số.
 
 **(b3) `autofix.py`:**
-- **Prompt →** Viết `pipeline/steps/autofix.py` hàm `fix(ds, issues, cfg) -> list[dict]` chỉ sửa `ERROR` trên `ds` (`remove_image`, `rename_classes`, `needs_label` không tạo file, `drop_line`, `clip_box`), gom theo file giữ số dòng gốc, `drop_line` thắng `clip_box`.
-- **AI trả gì →** Hàm `fix` + helper `_clip_yolo_box` xử lý đủ 5 nhóm action và ghi log trước–sau.
-- **Tôi kiểm bằng cách nào →** Kiểm tra không sửa `WARN`, không đụng `data/raw/`, chạy `python -m pytest tests/test_autofix.py -q` (`11 passed`).
-- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Yêu cầu xử lý rõ ca box nằm hẳn ngoài ảnh sau clip (`x2 <= x1` hoặc `y2 <= y1`) phải chuyển thành `drop_line` thay vì ghi box `0 0`, và bỏ qua dòng nhãn của ảnh vừa bị `remove_image`.
+- **Prompt →** Viết `pipeline/steps/autofix.py` hàm `fix(ds, issues, cfg) -> list[dict]` chỉ sửa lỗi `ERROR` trên bản sao `ds` (`remove_image`, `rename_classes`, `needs_label` không tạo file, `drop_line`, `clip_box` hoặc `drop_line` nếu box ngoài ảnh hoàn toàn), gom theo file giữ nguyên số dòng gốc, ưu tiên `drop_line` trước `clip_box`.
+- **AI trả gì →** Hàm `fix` + helper `_clip_yolo_box` xử lý đủ 5 nhóm action và trả về log trước–sau (`image`, `line`, `action`, `before`, `after`).
+- **Tôi kiểm bằng cách nào →** Kiểm tra không sửa `WARN`, không đụng `data/raw/`, chạy `python -m pytest tests/test_autofix.py -q` đạt `11 passed`.
+- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Yêu cầu xử lý rõ ca box nằm hẳn ngoài ảnh sau clip (`x2 <= x1` hoặc `y2 <= y1`) chuyển thành `drop_line` thay vì ghi box `0 0`, và bỏ qua êm issue dòng nhãn của ảnh vừa bị `remove_image`.
 
 **(b4) `second_opinion.py`:**
-- **Prompt →** Viết `pipeline/checks/second_opinion.py` hàm `run(ds, cfg, preds=None)` so nhãn với dự đoán `yolo26l` sinh 4 `WARN` (`POSSIBLE_MISSING`, `POSSIBLE_LOOSE_BOX`, `POSSIBLE_WRONG_CLASS`, `POSSIBLE_FALSE_POS`), giữ số dòng gốc, đọc 6 ngưỡng từ `cfg["second_opinion"]`.
-- **AI trả gì →** Hàm `run` 2 pha (Pha A lọc `conf` + `min_area_px`, Pha B lọc `fp_conf` không lọc diện tích) + helper `_read_valid_labels`.
-- **Tôi kiểm bằng cách nào →** Chạy `python -m pytest tests/test_second_opinion.py -q` (`15 passed`) và toàn bộ `pytest -q` (`79 passed`).
-- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Yêu cầu dùng `ds.read_label_lines` thay cho `ds.valid_boxes` (vì `valid_boxes` mất số dòng gốc khi có dòng trắng/hỏng) và im lặng ở ca khác lớp có IoU mơ hồ `[iou_missing, iou_match)`.
+- **Prompt →** Viết `pipeline/checks/second_opinion.py` hàm `run(ds, cfg, preds=None)` so nhãn với dự đoán `checker` (`yolo26l`) để sinh 4 cảnh báo `WARN` (`POSSIBLE_MISSING`, `POSSIBLE_LOOSE_BOX`, `POSSIBLE_WRONG_CLASS`, `POSSIBLE_FALSE_POS`), dùng `ds.read_label_lines` giữ số dòng gốc, đọc 6 ngưỡng từ `cfg["second_opinion"]`.
+- **AI trả gì →** Hàm `run` 2 pha (Pha A lọc `conf` + `min_area_px`, Pha B lọc `fp_conf` và không lọc `min_area_px`) + helper `_read_valid_labels`.
+- **Tôi kiểm bằng cách nào →** Kiểm tra thứ tự ưu tiên nhánh cùng lớp trước khác lớp; chạy `python -m pytest tests/test_second_opinion.py -q` đạt `15 passed` và toàn bộ `python -m pytest -q` đạt `79 passed`.
+- **Chỗ AI sai/thiếu và tôi sửa thế nào →** Không dùng `ds.valid_boxes(stem)` vì làm mất số dòng gốc khi có dòng trắng/hỏng; nhánh mơ hồ khác lớp trong `[iou_missing, iou_match)` im lặng không sinh cảnh báo giả.
